@@ -1,22 +1,20 @@
-import { computed, ref } from 'vue';
-import { graphqlQuery } from '../api/graphql';
-import { SERVER_TIME_QUERY } from '../api/queries/serverTime';
+import { ref } from 'vue';
 
 const offsetMs = ref(0);
 const lastSyncedAt = ref(null);
 
 export function useServerTime() {
-    const now = computed(() => Date.now() + offsetMs.value);
+    const getNow = () => Date.now() + offsetMs.value;
 
-    const sync = async () => {
-        const data = await graphqlQuery(SERVER_TIME_QUERY);
-        const serverTime = new Date(data?.serverTime?.serverTimeUtc).getTime();
-        offsetMs.value = serverTime - Date.now();
+    const sync = async (force = false) => {
+        // Keep the interface stable without making backend time requests.
+        // The app now uses the browser clock as the timer source of truth.
+        offsetMs.value = 0;
         lastSyncedAt.value = new Date().toISOString();
     };
 
     return {
-        now,
+        getNow,
         offsetMs,
         lastSyncedAt,
         sync,

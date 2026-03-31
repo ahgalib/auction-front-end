@@ -1,7 +1,7 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useAuctionStore } from '../stores/auctionStore';
-import { useAuthStore } from '../stores/authStore';
+import { useAuthStore } from '../stores/auth';
 import { useAuctionSubscription } from '../composables/useAuctionSubscription';
 import AuctionCountdown from '../components/auction/AuctionCountdown.vue';
 import BidActionPad from '../components/auction/BidActionPad.vue';
@@ -23,6 +23,9 @@ const auth = useAuthStore();
 const toast = ref('');
 const toastKind = ref('info');
 const ariaStatus = ref('');
+const closingAuction = ref(false);
+let auctionEndTimer = null;
+let handledEndTime = null;
 
 const loginForm = ref({
     email: '',
@@ -87,32 +90,121 @@ const handleBid = async (amount) => {
 };
 
 const handleRegister = async () => {
-    await auth.register(registerForm.value);
-    showToast('Registration successful');
+    const result = await auth.register(registerForm.value.name, registerForm.value.email, registerForm.value.password);
+    if (result.success) {
+        showToast('Registration successful');
+    } else {
+        showToast(auth.error || 'Registration failed', 'error');
+    }
+};
+
+const handleCountdownEnded = async () => {
+    const currentEndTime = auction.endTime;
+    if (!auction.isActive || !currentEndTime || closingAuction.value || handledEndTime === currentEndTime) return;
+
+    closingAuction.value = true;
+    handledEndTime = currentEndTime;
+
+    try {
+        auction.isActive = false;
+        await auction.fetchAuction(true);
+
+        if (auction.winnerName) {
+            showToast(`${auction.winnerName} won the auction!`, 'success');
+        } else {
+            showToast('Auction closed.', 'info');
+        }
+    } finally {
+        closingAuction.value = false;
+    }
+};
+
+const handleIncomingBidEvent = (payload) => {
+    const bidderName = payload?.bidderName;
+    const amount = Number(payload?.amount ?? 0);
+
+    if (!bidderName || bidderName === auth.user?.name) {
+        return;
+    }
+
+    showToast(`${bidderName} just bid $${amount.toFixed(2)}`, 'info');
 };
 
 const handleLogin = async () => {
-    await auth.login(loginForm.value);
-    showToast('Logged in');
+    const result = await auth.login(loginForm.value.email, loginForm.value.password, false);
+    if (result.success) {
+        showToast('Logged in');
+    } else {
+        showToast(auth.error || 'Login failed', 'error');
+    }
 };
 
 const handleOAuth = async () => {
-    await auth.oauthPasswordGrant(oauthForm.value);
-    showToast('OAuth token issued');
+    const result = await auth.oauthPasswordGrant(oauthForm.value);
+    if (result.success) {
+        showToast('OAuth token issued');
+    } else {
+        showToast(auth.error || 'OAuth login failed', 'error');
+    }
 };
 
 const connectionLost = computed(() => auction.connectionState === 'disconnected');
+const liveBidderCount = computed(() => Math.max(Number(auction.watcherCount ?? 0), Number(auction.participantCount ?? 0)));
+
+const clearAuctionEndTimer = () => {
+    if (auctionEndTimer) {
+        window.clearTimeout(auctionEndTimer);
+        auctionEndTimer = null;
+    }
+};
+
+const scheduleAuctionEndWatcher = () => {
+    clearAuctionEndTimer();
+
+    if (!auction.isActive || !auction.endTime) {
+        return;
+    }
+
+    const endAt = new Date(auction.endTime).getTime();
+    if (!Number.isFinite(endAt)) {
+        return;
+    }
+
+    const delay = Math.max(0, endAt - Date.now());
+    auctionEndTimer = window.setTimeout(() => {
+        void handleCountdownEnded();
+    }, delay);
+};
 
 onMounted(async () => {
     await auction.bootstrap(props.auctionId);
     try {
-        await auth.me();
+        await auth.checkAuth();
     } catch {
         // No token session.
     }
 });
 
-useAuctionSubscription(auction);
+useAuctionSubscription(auction, {
+    onBidEvent: handleIncomingBidEvent,
+});
+
+watch(
+    () => [auction.endTime, auction.isActive, auction.auctionId],
+    () => {
+        if (!auction.isActive) {
+            handledEndTime = null;
+        } else if (handledEndTime && handledEndTime !== auction.endTime) {
+            handledEndTime = null;
+        }
+        scheduleAuctionEndWatcher();
+    },
+    { immediate: true }
+);
+
+onUnmounted(() => {
+    clearAuctionEndTimer();
+});
 </script>
 
 <template>
@@ -123,16 +215,31 @@ useAuctionSubscription(auction);
             <header class="mb-6 flex flex-wrap items-center justify-between gap-3">
                 <div>
                     <p class="text-xs uppercase tracking-[0.25em] text-cyan-200/70">Velocity War Room</p>
-                    <h1 class="text-3xl font-semibold text-white">Auction #{{ auction.auctionId }}</h1>
+                    <h1 class="text-3xl font-semibold text-white">{{ auction.title || `Auction #${auction.auctionId}` }}</h1>
+                    <p class="mt-1 text-sm text-cyan-100/80">{{ auction.description || 'Live competitive auction room.' }}</p>
+                    <p class="mt-1 text-xs uppercase tracking-[0.2em] text-cyan-200/70">
+                        {{ auction.category || 'General' }} | Participants: {{ auction.participantCount }}
+                    </p>
                 </div>
-                <ParticipationBadge :watcher-count="auction.watcherCount" :connection-state="auction.connectionState" />
+                <ParticipationBadge :watcher-count="liveBidderCount" :connection-state="auction.connectionState" />
             </header>
 
             <div class="grid gap-4 lg:grid-cols-[2fr_1fr]">
                 <section class="space-y-4">
                     <LivePriceDisplay :price="auction.currentPrice" />
-                    <AuctionCountdown :end-time="auction.endTime" />
-                    <BidActionPad :current-price="auction.currentPrice" :disabled="auction.bidPending || !auth.isAuthenticated" @submit="handleBid" />
+                    <AuctionCountdown :end-time="auction.endTime" :is-active="auction.isActive" @ended="handleCountdownEnded" />
+                    <BidActionPad :current-price="auction.currentPrice" :disabled="auction.bidPending || !auth.isAuthenticated || !auction.isActive" @submit="handleBid" />
+                    <div v-if="!auction.isActive" class="rounded-xl border border-emerald-300/40 bg-emerald-500/10 p-4 text-sm">
+                        <div class="celebration-wrap">
+                            <div class="confetti-strip"></div>
+                            <p class="text-xs uppercase tracking-[0.2em] text-emerald-200/90">Auction Closed</p>
+                            <p class="mt-2 text-2xl font-bold text-emerald-50 celebration-pop">Winner: {{ auction.winnerName || 'No winner' }}</p>
+                            <p class="mt-1 text-emerald-100/90">
+                                Final Price: ${{ Number(auction.currentPrice).toFixed(2) }}
+                            </p>
+                            <p class="mt-2 text-xs text-emerald-100/80">Congratulations to the winner. Bidding is now locked.</p>
+                        </div>
+                    </div>
                     <p class="sr-only" aria-live="assertive">{{ ariaStatus }}</p>
                 </section>
 
@@ -170,3 +277,48 @@ useAuctionSubscription(auction);
         <ToastMessage :message="toast" :kind="toastKind" />
     </main>
 </template>
+
+<style scoped>
+.celebration-wrap {
+    position: relative;
+    overflow: hidden;
+    border-radius: 0.75rem;
+    padding: 0.5rem 0.25rem;
+}
+
+.confetti-strip {
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 4px;
+    background: linear-gradient(90deg, #f59e0b, #10b981, #06b6d4, #f43f5e, #f59e0b);
+    background-size: 200% 100%;
+    animation: confettiShift 2s linear infinite;
+}
+
+.celebration-pop {
+    animation: winnerPop 900ms ease-out;
+}
+
+@keyframes confettiShift {
+    0% {
+        background-position: 0% 50%;
+    }
+    100% {
+        background-position: 200% 50%;
+    }
+}
+
+@keyframes winnerPop {
+    0% {
+        transform: scale(0.92);
+        opacity: 0.5;
+    }
+    60% {
+        transform: scale(1.04);
+        opacity: 1;
+    }
+    100% {
+        transform: scale(1);
+    }
+}
+</style>

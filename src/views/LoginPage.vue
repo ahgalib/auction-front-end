@@ -40,7 +40,11 @@ const handleSubmit = async () => {
     const result = await authStore.login(email.value, password.value, rememberMe.value);
 
     if (result.success) {
-        router.push('/bid/1');
+        if (authStore.user?.is_admin) {
+            router.push('/admin/auctions');
+        } else {
+            router.push('/auctions');
+        }
     } else {
         generalError.value = 'Invalid email or password';
     }
